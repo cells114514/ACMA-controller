@@ -89,7 +89,7 @@ class SDKTests(unittest.TestCase):
                               capture_output=True,encoding='utf-8',env=env,timeout=10)
         self.assertEqual(result.returncode,0,result.stderr)
         catalog=json.loads(result.stdout)
-        self.assertEqual(len(catalog),31)
+        self.assertEqual(len(catalog),33)
         self.assertTrue(all('parameters' in t for t in catalog))
 
     def test_runtime_is_pinned_to_a_single_vm(self):
@@ -97,6 +97,25 @@ class SDKTests(unittest.TestCase):
         with self.controller.store.db() as db:
             db.execute("UPDATE settings SET value='00000000-0000-4000-8000-000000000099' WHERE key='registered_vm_id'")
         with self.assertRaisesRegex(ValueError,'another VM'):Controller(backend=self.backend,directory=self.root)
+
+    def test_batch_reuses_real_queue_and_returns_individual_receipts(self):
+        self.controller.resume()
+        result=self.controller.call('execute_batch',{'actions':[{'tool':'list_apps','arguments':{}},{'tool':'get_screen_size','arguments':{}}]})
+        self.assertEqual(result['status'],'completed');self.assertEqual(result['completed_count'],2)
+        self.assertTrue(all(s['result']['id'] for s in result['steps']))
+
+    def test_screenshot_view_is_registered_and_does_not_refresh_capture_age(self):
+        from PIL import Image
+        self.controller.resume()
+        row=self.controller.call('get_window_state',{'pid':10,'window_id':20,'include_screenshot':True})
+        source=self.controller.store.directory/'test-source.png';Image.new('RGB',(2400,1600),'blue').save(source)
+        result={**row['result'],'image_path':str(source),'capture_id':'driver-capture','screenshot_width':2400,'screenshot_height':1600,
+                'observed_at':'2020-01-01T00:00:00+00:00'}
+        self.controller.store.finish(row['id'],'succeeded',result)
+        view=self.controller.call('screenshot_view',{'capture':row['id'],'region':[100,200,500,600]})
+        self.assertEqual(view['source_capture'],row['id'])
+        with self.assertRaisesRegex(ValueError,'expired'):
+            self.controller.call('click',{'pid':10,'window_id':20,'x':10,'y':10,'coordinate_space':'view_pixels','view_id':view['view_id']},capture=row['id'])
 
 
 if __name__=='__main__':unittest.main()

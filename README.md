@@ -5,7 +5,7 @@
 
 [中文](#中文) · [English](#english) · [API](docs/API.md) · [Setup / 部署](docs/SETUP.md) · [Security / 边界](SECURITY.md)
 
-> **0.1.0 · Experimental / 实验版本** — Windows host + Windows guest, Hyper-V lifecycle management, Cua Driver desktop execution. Standard-library Python runtime; no model API key. / Windows 宿主与客户机，Python 运行层仅用标准库，无需模型密钥。
+> **0.2.0 · Experimental / 实验版本** — Windows host + Windows guest, Hyper-V lifecycle management, Cua Driver desktop execution. Standard-library core, optional Pillow imaging extra; no model API key. / Windows 宿主与客户机，核心运行层仅用标准库，截图变换选装 Pillow，无需模型密钥。
 
 ## 中文
 
@@ -48,7 +48,7 @@ Windows 客户机 · 受保护桥接脚本 · 交互会话中的 Cua Driver
 git clone https://github.com/cells114514/ACMA-controller.git
 cd ACMA-controller
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install .
+.\.venv\Scripts\python.exe -m pip install ".[imaging]"
 Copy-Item config.example.json config.local.json
 # 编辑 config.local.json，填写自己的 VM GUID、名称和客户机身份。
 ```
@@ -102,7 +102,7 @@ python -m unittest discover -s tests
 
 The agent decides what to do; the controller executes and returns observable facts. It does not plan tasks, manage chats/personas/memory/skills, or independently decide whether the user's goal is complete.
 
-It exposes a model-independent Python SDK and authenticated loopback HTTP interface over a durable execution queue, a pinned SSH guest bridge, Cua Driver and a fixed-target Hyper-V adapter. One process registers one VM. No model API key or third-party runtime Python dependency is required.
+It exposes a model-independent Python SDK and authenticated loopback HTTP interface over a durable execution queue, a pinned SSH guest bridge, Cua Driver and a fixed-target Hyper-V adapter. One process registers one VM. No model API key is required. The core is standard-library-only; screenshot transforms use the optional Pillow extra.
 
 ### Features and boundaries
 
@@ -126,7 +126,7 @@ Use Windows with Hyper-V management components, appropriate permissions, Python 
 git clone https://github.com/cells114514/ACMA-controller.git
 cd ACMA-controller
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install .
+.\.venv\Scripts\python.exe -m pip install ".[imaging]"
 Copy-Item config.example.json config.local.json
 # Edit the local file with your VM GUID/name and guest identity.
 ```
@@ -171,3 +171,13 @@ python -m unittest discover -s tests
 ```
 
 No personal configuration, credentials, screenshots, logs, databases or VM images are shipped. See [security boundaries](SECURITY.md) and [third-party notices](THIRD_PARTY_NOTICES.md). ACMA-controller is [MIT licensed](LICENSE); Cua Driver is installed separately under its applicable upstream terms.
+
+## 0.2：批量与视觉 / Batches and visual views
+
+- `execute_batch`：最多16个顺序子动作，最多30秒新动作派发窗口。失败、未知、不匹配、暂停或截止即停，剩余步骤明确 `not_executed`；已派发动作不会回滚。可以用 `{"$result":0,"path":"/matches/0/element_token"}` 引用前一步的新数据。不包含异步命令、虚拟机生命周期、计划或嵌套批次。
+- `screenshot_view`：按原始 capture 生成缩放/局部视图，返回 view_id、裁剪范围、原始与发送尺寸及双向映射。默认最大1280×960、120万像素。像素输入用 `coordinate_space:"view_pixels"` 与 `view_id`，由控制器还原，原捕获有效期/窗口检查不变。HTTP 可用 `GET /v1/views/<view_id>` 取 PNG。
+- 截图历史裁剪和模型缓存策略属于上层 Agent，刻意不放入这个模型无关服务。配套 ACMA Agent 使用固定槽位、最少保留3张、每8张新截图集中清理；这不是 Claude 专用协议。
+
+`execute_batch` runs up to 16 actions sequentially, with a 30-second admission window. It stops on failure, unknown/mismatching results, pause or deadline and marks remaining actions `not_executed`; completed actions are not rolled back. Earlier-result references avoid guessing fresh tokens. Async commands, VM lifecycle actions, plans and nested batches are outside the batch interface.
+
+`screenshot_view` produces bounded full/cropped views with explicit reversible coordinates; use `view_pixels` + `view_id` for input mapping. Original capture freshness/target checks remain mandatory. Download view PNGs at `/v1/views/<view_id>`. Model screenshot retention/caching belongs in the agent layer, not this service. No Claude adapter or Anthropic SDK is added.

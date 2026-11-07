@@ -1,5 +1,5 @@
 """Model-independent Windows VM control interface."""
-__version__='0.1.0'
+__version__='0.2.0'
 
 def __getattr__(name):
     if name=='Controller':

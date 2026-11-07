@@ -19,3 +19,9 @@ Driver 单独安装，本项目不执行上游在线安装脚本，也不安装/
 These are separately installed platform/runtime prerequisites under their own terms. The local Python package has no third-party runtime Python dependencies. CI packaging uses setuptools; CI uses GitHub-maintained checkout/setup-python actions.
 
 它们是单独安装的平台前置条件，适用各自条款。Python 运行层仅使用标准库。
+
+## Optional screenshot transforms / 可选截图变换
+
+The `imaging` extra installs Pillow (separately distributed under its upstream license). Base control, queues and VM tools remain standard-library-only. Pillow is not vendored. Batch ordering and screenshot mapping are ACMA implementations; no Anthropic SDK, Computer Use model, API adapter or reference source was incorporated in this revision.
+
+`imaging` 选装项单独安装 Pillow，适用其上游许可；基础控制接口仍仅使用标准库。本次未复制 Anthropic 示例源码，也未添加其SDK、模型或协议适配。

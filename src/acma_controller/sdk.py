@@ -129,6 +129,33 @@ class Controller:
         if not 0<seconds<=120:raise ValueError('Wait must be 0 < seconds <= 120')
         with self.lock:
             if not self.started:raise ValueError('Start the controller first')
+            if name=='screenshot_view':
+                from .visuals import prepare
+                row=self.store.get(arguments['capture']);source=(row.get('result') or {}).get('image_path')
+                if row['state']!='succeeded' or not source or not Path(source).resolve().is_relative_to(self.store.directory.resolve()):raise ValueError('A registered controller screenshot is required')
+                view=prepare(source,self.store.directory/'views',arguments['capture'],**{k:arguments[k] for k in ('region','max_width','max_height') if k in arguments})
+                return {**view,'capture':arguments['capture'],'verification':{'status':'confirmed','reason':'derived read-only view; source freshness not extended'}}
+            if name=='execute_batch':
+                from .batching import execute
+                until=time.monotonic()+min(seconds,30)
+                def guard():
+                    if self.store.mode()!='running' or self.stopping.is_set() or time.monotonic()>=until:raise ValueError('Batch paused, stopped or deadline reached')
+                    if self.unresolved():raise ValueError('A prior action is still running or unknown; inspect its receipt')
+                supported={t['name'] for t in self.tools()}
+                for item in arguments['actions']:
+                    if not isinstance(item,dict) or item.get('tool') not in supported:raise ValueError('Batch contains a tool not supported by this controller')
+                def dispatch(tool,args):
+                    source=args.pop('capture',None) if tool in {'click','double_click','right_click','drag','scroll','move_cursor'} else None
+                    return self.call(tool,args,capture=source,seconds=max(.01,min(seconds,until-time.monotonic())))
+                return execute(arguments['actions'],dispatch,guard,seconds=min(seconds,30))
+            if arguments.get('coordinate_space')=='view_pixels':
+                from .visuals import load,arguments as map_arguments
+                view=load(self.store.directory/'views',arguments.get('view_id'))
+                mapped=map_arguments({**arguments,'capture':capture or view['source_capture']},view)
+                capture=mapped.pop('capture');mapped.pop('coordinate_space');arguments=mapped
+            elif 'view_id' in arguments:raise ValueError('view_id requires coordinate_space=view_pixels')
+            elif 'coordinate_space' in arguments:
+                if arguments.pop('coordinate_space')!='screenshot_pixels':raise ValueError('Use original screenshot_pixels or a registered view_pixels mapping')
             if name in vm_tools.READ|vm_tools.MUTATE:
                 if name in vm_tools.MUTATE:
                     if self.store.mode()!='running' or self.unresolved():raise ValueError('Resume the controller and reconcile actions first')

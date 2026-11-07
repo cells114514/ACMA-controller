@@ -47,6 +47,14 @@ def make_server(controller,token,port=8767):
                     if not p.is_relative_to(controller.store.directory.resolve()):raise ValueError('Unregistered capture path')
                     body=p.read_bytes();self.send_response(200);self.send_header('Content-Type','image/png')
                     self.send_header('Content-Length',str(len(body)));self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(body);return
+                elif path.startswith('/v1/views/'):
+                    from .visuals import load
+                    from pathlib import Path
+                    view=load(controller.store.directory/'views',path.rsplit('/',1)[-1])
+                    p=Path(view['image_path']).resolve()
+                    if not p.is_relative_to((controller.store.directory/'views').resolve()):raise ValueError('Unregistered view image')
+                    body=p.read_bytes();self.send_response(200);self.send_header('Content-Type','image/png')
+                    self.send_header('Content-Length',str(len(body)));self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(body);return
                 else:return self.reply(404,{'error':'Unknown endpoint'})
                 return self.reply(200,{'result':result})
             except (ValueError,KeyError,OSError) as error:return self.reply(409,{'error':str(error),'retry_action':False})

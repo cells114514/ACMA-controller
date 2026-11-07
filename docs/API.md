@@ -35,9 +35,9 @@ Default: `http://127.0.0.1:8767`. All requests require `Authorization: Bearer <A
 {"request_id":"click-001","tool":"click","arguments":{"pid":1234,"window_id":5678,"element_token":"<fresh token from that window>"}}
 ```
 
-Pixel actions use **physical guest screen coordinates** and a separate fresh `capture` observation action ID. They are not normalized 0–1000 or window-relative screenshot coordinates. Use `drag` with `scope:"desktop"` for native desktop input; PID/HWND still ground the observed target. `set_value` is not exposed.
+Pixel actions use **original capture pixel coordinates** and a separate fresh `capture` observation action ID. They are not normalized 0–1000 or window-relative screenshot coordinates. Use `drag` with `scope:"desktop"` for native desktop input; PID/HWND still ground the observed target. `set_value` is not exposed.
 
-像素操作用客户机物理屏幕坐标，外层提供 `capture` 观察编号；不能直接传归一化或窗口局部坐标。桌面拖动使用 `drag` 与 `scope:"desktop"`。
+像素操作用原始截图像素坐标，外层提供 `capture` 观察编号；不能直接传归一化或窗口局部坐标。桌面拖动使用 `drag` 与 `scope:"desktop"`。
 
 ```json
 {"request_id":"drag-001","tool":"drag","capture":"<observation action id>","arguments":{"pid":1234,"window_id":5678,"scope":"desktop","from_x":100,"from_y":200,"to_x":400,"to_y":200,"duration_ms":800}}
@@ -79,3 +79,25 @@ POST returns `request_id` and `result`. Guest calls return queue rows (`id`, `st
 ## Compatibility / 兼容范围
 
 `0.1.0` uses `/v1`; retrieve actual tool definitions from the running service. Future incompatible wire changes use a new API version. Core APIs remain experimental. One controller process owns one VM. No model-provider, planning, persona, memory or chat-history endpoints are included.
+
+## Batch and view tools / 批量与截图视图
+
+```json
+{"request_id":"batch-001","tool":"execute_batch","arguments":{"actions":[{"tool":"find_elements","arguments":{"pid":1234,"window_id":5678,"query":"Search"}},{"tool":"click","arguments":{"pid":1234,"window_id":5678,"element_token":{"$result":0,"path":"/matches/0/element_token"}}}]}}
+```
+
+Earlier results use zero-based indices and JSON pointers. A missing/ambiguous result must be handled by the caller; never guess an index from an incomplete search. Every resolved child still passes the normal tool and stale-reference guards. A batch is not a transaction: inspect individual steps and continue from observed state, not by replaying the whole batch.
+
+引用索引从0开始，路径为JSON pointer；动态引用不会绕过子工具校验。一次匹配多项不代表第一个一定正确，调用方必须根据目标选择。批次非事务，部分完成后不能整批重发。
+
+```json
+{"request_id":"view-001","tool":"screenshot_view","arguments":{"capture":"<registered-source-action-id>","region":[100,200,500,600],"max_width":1280,"max_height":960}}
+```
+
+```json
+{"request_id":"view-click-001","tool":"click","capture":"<same-source-action-id>","arguments":{"pid":1234,"window_id":5678,"coordinate_space":"view_pixels","view_id":"<view-id>","x":50,"y":20}}
+```
+
+The crop above maps view origin to source pixel (100,200); when unscaled, view (50,20) maps to source (150,220). Tool guards still require the source capture to be fresh and belong to that PID/HWND. Views neither recapture the desktop nor renew freshness. Without a view, captured window coordinates are relative to the original window screenshot, and desktop coordinates to the original full-desktop screenshot; the native adapter verifies the mapping to physical pixels. Normalized 0–1000 coordinates are not accepted by this SDK.
+
+局部图本身不是新捕获，不延长源截图有效期；窗口坐标相对窗口原图、桌面坐标相对桌面原图，物理屏幕换算由已有适配器验证。归一化坐标不是本SDK接口。
