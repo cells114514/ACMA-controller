@@ -1,0 +1,13 @@
+{
+  "status": "pinned",
+  "vm_id": "00000000-0000-4000-8000-000000000001",
+  "user": "operator",
+  "computer": "WINDOWS-GUEST",
+  "user_sid": "S-1-5-21-100-200-300-1001",
+  "address": "192.168.100.10",
+  "host_address": "192.168.100.1",
+  "host_key": "ssh-ed25519 REPLACE_WITH_VERIFIED_GUEST_PUBLIC_HOST_KEY",
+  "key": "C:/LOCAL-PRIVATE-DATA/connection/id_ed25519",
+  "known_hosts": "C:/LOCAL-PRIVATE-DATA/connection/known_hosts",
+  "ssh_config": "C:/LOCAL-PRIVATE-DATA/connection/ssh_config"
+}

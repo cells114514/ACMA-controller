@@ -1,0 +1,7 @@
+{
+  "vm_id": "00000000-0000-4000-8000-000000000001",
+  "vm_name": "ExampleVM",
+  "guest_user": "operator",
+  "guest_computer": "WINDOWS-GUEST",
+  "guest_workspace": "C:\\ACMA\\Workspace"
+}
