@@ -541,7 +541,11 @@ class Worker:
                 self.backend.own_input(True)
             self.store.recover()
             return
-        self._lock_file = open(self.store.directory / "worker.lock", "a+b")
+        # The portable test/runtime lock must cover the registered VM even if
+        # two callers choose different queue directories, like the Windows mutex.
+        lock_directory=runtime_root()/'locks'
+        lock_directory.mkdir(parents=True,exist_ok=True)
+        self._lock_file = open(lock_directory / ('vm-'+VM_ID.lower()+'.lock'), "a+b")
         self._lock_file.seek(0)
         self._lock_file.write(b"0")
         self._lock_file.flush()
