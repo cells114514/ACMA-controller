@@ -79,6 +79,13 @@ def is_launch_preflight_refusal(config,request_id,reply):
         and reply.get('outcome')=='rejected_before_dispatch' and isinstance(reply.get('error'),str))
 
 
+def is_command_preflight_refusal(config,request_id,reply):
+    return (isinstance(reply,dict) and reply.get('request_id')==request_id
+        and all(reply.get(k)==config.get(k) for k in ('vm_id','computer','user_sid'))
+        and reply.get('command_failure_protocol')=='v2' and reply.get('phase')=='command_preflight'
+        and reply.get('code')=='command_preflight_failed' and reply.get('dispatched') is False)
+
+
 def ssh_argv(config: dict) -> list[str]:
     return [
         "ssh.exe", "-F", config["ssh_config"], "-T", "-i", config["key"],
@@ -113,7 +120,7 @@ def request(config: dict, operation: str, tool: str | None = None, arguments: di
         if not isinstance(arguments, dict) or not isinstance(arguments.get("path"), str):
             raise ValueError("Guest test-file path required")
         payload["path"] = arguments["path"]
-    elif operation.startswith("command_"):
+    elif operation.startswith("command_") and operation!="command_capabilities":
         if not isinstance(arguments, dict):
             raise ValueError("Command arguments required")
         payload["arguments"] = arguments
@@ -132,7 +139,7 @@ def request(config: dict, operation: str, tool: str | None = None, arguments: di
         if result.returncode:
             try:failure=json.loads(result.stdout)
             except (ValueError,TypeError):failure=None
-            if operation=='cua' and tool=='launch_app' and is_launch_preflight_refusal(config,request_id,failure):
+            if (operation=='cua' and tool=='launch_app' and is_launch_preflight_refusal(config,request_id,failure)) or (operation=='command_start' and is_command_preflight_refusal(config,request_id,failure)):
                 response_path=ARTIFACTS/f"{request_id}.response.json"
                 response_path.write_text(json.dumps(failure,ensure_ascii=False,indent=2),encoding='utf-8')
                 audit.update(state='rejected_before_dispatch',response_file=str(response_path),error_code=failure['code'])

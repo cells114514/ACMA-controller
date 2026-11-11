@@ -125,6 +125,12 @@ try {
         [Console]::WriteLine(($reply | ConvertTo-Json -Depth 12 -Compress))
         exit 0
     }
+    if($request.op -eq 'command_capabilities'){
+        $version=1
+        if(([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'command-worker.ps1'))).Contains('ACMA_COMMAND_API=2') -and ([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'command-runner.cs'))).Contains('ACMA_COMMAND_API=2')){$version=2}
+        $reply=@{request_id=$requestId;vm_id=$config.vm_id;computer=$env:COMPUTERNAME;user_sid=$identity.User.Value;exit_code=0;command_api_version=$version}
+        [Console]::WriteLine(($reply|ConvertTo-Json -Compress));exit 0
+    }
     if($request.op -in @('command_start','command_status','command_cancel')){
         $commandArgs=$request.arguments
         $jobId=[string]$commandArgs.job_id
@@ -133,11 +139,20 @@ try {
         $jobDir=Join-Path $jobRoot $jobId
         if($request.op -eq 'command_start'){
             if(Test-Path -LiteralPath $jobDir){throw 'Command id already exists; no duplicate execution'}
+            $commandPreflight=$true
             if([string]::IsNullOrWhiteSpace([string]$commandArgs.script) -or ([string]$commandArgs.script).Length -gt 16000){throw 'Invalid guest command script'}
-            if($commandArgs.timeout_ms -lt 100 -or $commandArgs.timeout_ms -gt 120000 -or $commandArgs.output_limit -lt 256 -or $commandArgs.output_limit -gt 65536){throw 'Invalid guest command budgets'}
-            $workspace=[string]$config.guest_workspace
+            $generic=$commandArgs.command_api_version -eq 2
+            $persistent=$generic -and $commandArgs.persistent -eq $true
+            $validTimeout=if($persistent){$commandArgs.timeout_ms -eq 0 -or ($commandArgs.timeout_ms -ge 100 -and $commandArgs.timeout_ms -le 2147483000)}else{$commandArgs.timeout_ms -ge 100 -and $commandArgs.timeout_ms -le 120000}
+            if(-not $validTimeout -or $commandArgs.output_limit -lt 256 -or $commandArgs.output_limit -gt 65536){throw 'Invalid guest command budgets'}
+            $binding=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'binding.json') -Raw -Encoding UTF8|ConvertFrom-Json
+    $workspace=[string]$binding.guest_workspace
             $cwd=[IO.Path]::GetFullPath([string]$commandArgs.cwd)
-            if($cwd -ine $workspace -and -not $cwd.StartsWith($workspace+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Command cwd outside guest workspace'}
+            if($generic){
+                if([string]$commandArgs.cwd -notmatch '^[A-Za-z]:[\\/]'){throw 'Guest absolute drive path required'}
+                if(@($commandArgs.env.PSObject.Properties).Count -gt 64){throw 'Too many environment variables'}
+                foreach($p in $commandArgs.env.PSObject.Properties){if($p.Name -notmatch '^[A-Za-z_][A-Za-z0-9_]{0,127}$' -or $p.Value -isnot [string] -or $p.Value.Length -gt 4096 -or $p.Value.Contains([char]0)){throw 'Invalid process environment'}}
+            }elseif($cwd -ine $workspace -and -not $cwd.StartsWith($workspace+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Command cwd outside guest workspace'}
             [IO.Directory]::CreateDirectory($jobDir)|Out-Null
             $jobAcl=[Security.AccessControl.DirectorySecurity]::new()
             $jobAcl.SetAccessRuleProtection($true,$false)
@@ -153,16 +168,19 @@ try {
             $taskName='ACMA-P1-command-'+$jobId
             $taskAction=New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -Argument $workerArgs
             $taskPrincipal=New-ScheduledTaskPrincipal -UserId $identity.User.Value -LogonType Interactive -RunLevel Limited
-            $taskSettings=New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 4) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+            $executionLimit=if($persistent){[TimeSpan]::Zero}else{New-TimeSpan -Minutes 4}
+            $taskSettings=New-ScheduledTaskSettingsSet -ExecutionTimeLimit $executionLimit -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
             Register-ScheduledTask -TaskName $taskName -Action $taskAction -Principal $taskPrincipal -Settings $taskSettings -ErrorAction Stop|Out-Null
             $job=@{job_id=$jobId;state='starting';task_name=$taskName;requested_utc=[DateTime]::UtcNow.ToString('o')}
+            if($generic){$job.boot_id=([DateTime](Get-CimInstance Win32_OperatingSystem).LastBootUpTime).ToUniversalTime().Ticks}
             [IO.File]::WriteAllText((Join-Path $jobDir 'worker.json'),($job|ConvertTo-Json -Compress),$utf8)
+            $commandPreflight=$false
             Start-ScheduledTask -TaskName $taskName
         }else{
             if(-not (Test-Path -LiteralPath (Join-Path $jobDir 'request.json'))){throw 'Unknown command id'}
             if($request.op -eq 'command_cancel'){
-                [IO.File]::WriteAllText((Join-Path $jobDir 'cancel.flag'),'stop requested',$utf8)
-                $job=@{job_id=$jobId;state='stop_requested';exit_confirmed=$false}
+                if(Test-Path -LiteralPath (Join-Path $jobDir 'result.json')){$job=[IO.File]::ReadAllText((Join-Path $jobDir 'result.json'),$utf8)|ConvertFrom-Json}
+                else{[IO.File]::WriteAllText((Join-Path $jobDir 'cancel.flag'),'stop requested',$utf8);$job=@{job_id=$jobId;state='stop_requested';exit_confirmed=$false}}
             }elseif(Test-Path -LiteralPath (Join-Path $jobDir 'result.json')){
                 $job=[IO.File]::ReadAllText((Join-Path $jobDir 'result.json'),$utf8)|ConvertFrom-Json
             }else{
@@ -172,6 +190,7 @@ try {
                     $taskInfo=Get-ScheduledTaskInfo -TaskName $workerState.task_name -ErrorAction SilentlyContinue
                     $recent=($workerState.requested_utc -and ([DateTime]::UtcNow-[DateTime]::Parse($workerState.requested_utc)).TotalSeconds -lt 15)
                     $job=@{job_id=$jobId;state=$(if($task.State -eq 'Running'){'running'}elseif($recent -or $taskInfo.LastRunTime.Year -lt 2000){'starting'}else{'unknown'});exit_confirmed=$false;task_result=$taskInfo.LastTaskResult}
+                    if($workerState.boot_id -and $workerState.boot_id -ne ([DateTime](Get-CimInstance Win32_OperatingSystem).LastBootUpTime).ToUniversalTime().Ticks){$job=@{job_id=$jobId;state='stopped';exit_confirmed=$true;tree_terminated=$true;reason='Guest rebooted; old process not resumed';computer=$env:COMPUTERNAME;user_sid=$identity.User.Value}}
                 }else{
                     $job=@{job_id=$jobId;state='unknown';exit_confirmed=$false;reason='legacy detached worker returned no result; no retry'}
                 }
@@ -186,6 +205,32 @@ try {
             if($finishedTask -and $finishedTask.State -ne 'Running' -and @($finishedTask.Actions).Count -eq 1 -and $finishedTask.Actions[0].Arguments -cin $knownArgs){
                 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
             }
+        }
+        # Stream snapshots are bounded prefixes; keep draining pipes even once
+        # retention is full. Offsets never resume a process or send input.
+        $saved=[IO.File]::ReadAllText((Join-Path $jobDir 'request.json'),$utf8)|ConvertFrom-Json
+        if($saved.command_api_version -eq 2){
+            if($job -isnot [Collections.IDictionary]){$mapped=@{};foreach($p in $job.PSObject.Properties){$mapped[$p.Name]=$p.Value};$job=$mapped}
+            foreach($stream in @('stdout','stderr')){
+                $offsetName=$stream+'_offset';$offset=if($commandArgs.$offsetName){[long]$commandArgs.$offsetName}else{0}
+                $limit=if($commandArgs.max_bytes){[int]$commandArgs.max_bytes}else{65536}
+                if($offset -lt 0 -or $limit -lt 4 -or $limit -gt 65536){throw 'Invalid output cursor/budget'}
+                $file=Join-Path $jobDir ($stream+'.bin');$bytes=@()
+                if([IO.File]::Exists($file)){
+                    $reader=[IO.FileStream]::new($file,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+                    try{$bytes=[byte[]]::new([int]$reader.Length);$read=$reader.Read($bytes,0,$bytes.Length);if($read -ne $bytes.Length){throw 'Incomplete stream snapshot'}}finally{$reader.Dispose()}
+                }
+                if($offset -gt $bytes.Length){throw 'Output cursor exceeds retained bytes'}
+                if($offset -lt $bytes.Length -and ($bytes[$offset] -band 192) -eq 128){throw 'Output cursor must be a UTF-8 boundary'}
+                $end=[Math]::Min($bytes.Length,$offset+$limit)
+                if($end -lt $bytes.Length){while($end -gt $offset -and ($bytes[$end] -band 192) -eq 128){$end--}}
+                $job[$stream]=if($end -gt $offset){$utf8.GetString([byte[]]$bytes,[int]$offset,[int]($end-$offset))}else{''}
+                $job[$stream+'_next_offset']=$end;$job[$stream+'_retained_bytes']=$bytes.Length
+                $job[$stream+'_truncated']=[IO.File]::Exists($file+'.truncated')
+            }
+            $job.persistent=[bool]$saved.persistent;$job.command_api_version=2
+            $job.cwd=[IO.Path]::GetFullPath([string]$saved.cwd)
+            $job.process_started=[IO.File]::Exists((Join-Path $jobDir 'start.flag'));$job.dispatched=$job.process_started
         }
         $reply=@{request_id=$requestId;vm_id=$config.vm_id;computer=$env:COMPUTERNAME;user_sid=$identity.User.Value;bridge_session=[Diagnostics.Process]::GetCurrentProcess().SessionId;exit_code=0;command=$job}
         [Console]::WriteLine(($reply|ConvertTo-Json -Depth 10 -Compress))
@@ -243,14 +288,57 @@ try {
             if(-not (Test-Path -LiteralPath $resolved -PathType Leaf) -or [IO.Path]::GetExtension($resolved) -ine '.exe'){throw 'Executable not found'}
             if([IO.Path]::GetFileName($resolved) -iin $blockedApps){throw 'Launch blocked by user application denylist'}
             $launchArgs=@($argsObject.additional_arguments|Where-Object {$null -ne $_})
-            if($launchArgs.Count){throw 'Application launch arguments are not enabled in the standalone bridge'}
+            if($launchArgs.Count){
+                $edgeArgs=@('--inprivate','--no-first-run','--new-window','file:///C:/Program%20Files/ACMA/tests/browser-control.html')
+                $fixtureEdge=($resolved -ieq 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe' -and ($launchArgs|ConvertTo-Json -Compress) -ceq ($edgeArgs|ConvertTo-Json -Compress))
+                $fixtureNotepad=$false
+                if($resolved -ieq (Join-Path $env:WINDIR 'System32\notepad.exe') -and $launchArgs.Count -eq 1){
+                    $testFile=[IO.Path]::GetFullPath([string]$launchArgs[0])
+                    $fixtureNotepad=([IO.Path]::GetDirectoryName($testFile) -ieq [string]$config.guest_workspace -and [IO.Path]::GetFileName($testFile) -cmatch '^ACMA-P1-[0-9a-f]{32}\.txt$' -and (Test-Path -LiteralPath $testFile -PathType Leaf))
+                }
+                if(-not ($fixtureEdge -or $fixtureNotepad)){throw 'General application launch has no arguments; inline commands refused'}
+            }
             $argsObject.name=$resolved
             if(-not $launchArgs.Count){$argsObject.PSObject.Properties.Remove('additional_arguments')}
             $launchPreflight=$false
         }
+        $freeDesktop=($argsObject.scope -ceq 'desktop' -and -not $argsObject.pid -and -not $argsObject.window_id -and $tool -in @('click','scroll','drag','move_cursor','press_key','hotkey'))
         $desktopMove=($tool -ceq 'move_cursor' -and $argsObject.scope -ceq 'desktop')
         $desktopDrag=($tool -in @('drag','click') -and $argsObject.scope -ceq 'desktop')
-        if($desktopMove){
+        if($freeDesktop){
+            $permitted=switch($tool){
+                'click' {@('scope','session','x','y','button','count')}
+                'scroll' {@('scope','session','x','y','direction','by','amount')}
+                'drag' {@('scope','session','from_x','from_y','to_x','to_y','duration_ms')}
+                'move_cursor' {@('scope','x','y')}
+                'press_key' {@('scope','session','key','modifiers')}
+                'hotkey' {@('scope','session','keys')}
+            }
+            if(@($argsObject.PSObject.Properties|Where-Object {$_.Name -notin $permitted}).Count){throw 'Unexpected windowless desktop arguments; text input remains window-bound'}
+            $interactive=@(Get-Process -Name cua-driver -ErrorAction Stop|Where-Object {$_.SessionId -gt 0}|Select-Object -ExpandProperty SessionId -Unique)
+            if($interactive.Count -ne 1){throw 'Cannot select one interactive guest Driver session'}
+            # A global shortcut may be handled by Windows or another app. Do not
+            # promise application exclusion when no recipient can be bound.
+            if($blockedApps.Count){throw 'Windowless input cannot enforce an application denylist; use a bound-window operation'}
+            if($tool -in @('press_key','hotkey')){
+                if($tool -eq 'press_key'){
+                    if([string]::IsNullOrWhiteSpace([string]$argsObject.key) -or ([string]$argsObject.key).Length -gt 64){throw 'Invalid desktop key'}
+                    if(@($argsObject.modifiers|Where-Object {$_ -notin @('ctrl','alt','shift','win')}).Count){throw 'Invalid desktop modifiers'}
+                }elseif(@($argsObject.keys).Count -lt 2 -or @($argsObject.keys).Count -gt 5){throw 'Invalid desktop hotkey'}
+            }else{
+                $screenCheck=Invoke-AcmaDriverCli $driver 'call get_screen_size --socket \\.\pipe\cua-driver' '{}'
+                if($screenCheck.exit_code -ne 0){throw 'Cannot verify desktop size'}
+                $screen=$screenCheck.stdout|ConvertFrom-Json
+                $pairs=if($tool -eq 'drag'){@{x='from_x';y='from_y'},@{x='to_x';y='to_y'}}else{@{x='x';y='y'}}
+                foreach($pair in $pairs){
+                    $x=$argsObject.($pair.x);$y=$argsObject.($pair.y)
+                    if($null -eq $x -or $null -eq $y -or [double]::IsNaN([double]$x) -or [double]::IsInfinity([double]$x) -or [double]::IsNaN([double]$y) -or [double]::IsInfinity([double]$y) -or $x -lt 0 -or $y -lt 0 -or $x -ge $screen.width -or $y -ge $screen.height){throw 'Desktop point outside current guest screen'}
+                }
+                if($tool -eq 'click' -and ($argsObject.button -notin @('left','right','middle') -or $argsObject.count -lt 1 -or $argsObject.count -gt 3)){throw 'Invalid desktop click'}
+                if($tool -eq 'scroll' -and ($argsObject.direction -notin @('up','down','left','right') -or $argsObject.amount -lt 1 -or $argsObject.amount -gt 30)){throw 'Invalid desktop scroll'}
+                if($tool -eq 'drag' -and ($argsObject.duration_ms -lt 1 -or $argsObject.duration_ms -gt 2000)){throw 'Invalid desktop drag'}
+            }
+        }elseif($desktopMove){
             if(@($argsObject.PSObject.Properties|Where-Object {$_.Name -notin @('scope','x','y','cursor_id')}).Count){throw 'Unexpected desktop cursor arguments'}
             $screenCheck=Invoke-AcmaDriverCli $driver 'call get_screen_size --socket \\.\pipe\cua-driver' '{}'
             if($screenCheck.exit_code -ne 0){throw 'Cannot verify guest screen bounds'}
@@ -318,6 +406,11 @@ try {
     [Console]::WriteLine(($reply | ConvertTo-Json -Depth 20 -Compress))
 } catch {
     $failure=@{request_id=$requestId;error=$_.Exception.Message;outcome='not_confirmed_no_automatic_retry'}
+    if($commandPreflight){
+        $failure.vm_id=$config.vm_id;$failure.computer=$env:COMPUTERNAME;$failure.user_sid=$identity.User.Value
+        $failure.command_failure_protocol='v2';$failure.phase='command_preflight';$failure.code='command_preflight_failed'
+        $failure.dispatched=$false;$failure.outcome='rejected_before_dispatch'
+    }
     if($launchPreflight){
         $failure.vm_id=$config.vm_id;$failure.computer=$env:COMPUTERNAME;$failure.user_sid=$identity.User.Value
         $failure.launch_failure_protocol='preflight-v1';$failure.phase='launch_preflight';$failure.code='launch_preflight_failed'

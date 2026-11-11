@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from .config import Config,bind,current,runtime_root
 from . import control,vm_tools
 from .element_search import COLLECTION,search_snapshot
+from .guest_commands import shells
 
 
 class LazyGuest:
@@ -92,6 +93,7 @@ class Controller:
             try:return self.store.get(identifier)
             except KeyError:return self.vm.status(identifier)
         return {'controller':self.store.mode(),'vm_id':self.config.vm_id,
+                'background_shells':shells(self.store),
                 'unresolved_actions':self.unresolved(),'pending_vm_operations':self.vm.pending(),
                 'recent_actions':self.store.recent(limit=20),
                 'recent_vm_operations':[{k:r.get(k) for k in ('operation_id','tool','state','started_at','finished_at')}
@@ -129,6 +131,13 @@ class Controller:
         if not 0<seconds<=120:raise ValueError('Wait must be 0 < seconds <= 120')
         with self.lock:
             if not self.started:raise ValueError('Start the controller first')
+            if name in {'shell_start','shell_status','shell_stop','command_status','command_cancel'} or name=='run_command' and 'command' in arguments:
+                from .commands import Commands
+                commands=Commands(self)
+                if name in {'shell_start','run_command'}:return commands.run(arguments,name=='shell_start',seconds)
+                return commands.query(name,arguments,seconds)
+            if name=='desktop_mouse' or name in {'press_key','hotkey'}:
+                return self._desktop_input(name,arguments,capture,seconds)
             if name=='screenshot_view':
                 from .visuals import prepare
                 row=self.store.get(arguments['capture']);source=(row.get('result') or {}).get('image_path')
@@ -199,6 +208,40 @@ class Controller:
     def tools(self):
         from .catalog import definitions
         return definitions()
+
+    def _desktop_input(self,name,args,capture,seconds):
+        from .desktop_inputs import key_arguments,validate_native
+        if name=='desktop_mouse':
+            source=args.pop('capture',capture);space=args.pop('coordinate_space',None)
+            if space=='view_pixels':
+                from .visuals import load,arguments as map_arguments
+                view=load(self.store.directory/'views',args.pop('view_id',None))
+                args=map_arguments({**args,'capture':source},view);args.pop('capture');args.pop('coordinate_space');space='screenshot_pixels'
+            elif 'view_id' in args:raise ValueError('view_id requires view_pixels')
+            if space not in {'screenshot_pixels','normalized_1000'}:raise ValueError('Explicit coordinate space required')
+            if space=='normalized_1000':
+                row=self.store.get(source);image=row.get('result') or {}
+                import struct
+                with Path(image['image_path']).open('rb') as f:header=f.read(24)
+                if header[:8]!=b'\x89PNG\r\n\x1a\n':raise ValueError('Desktop PNG required')
+                width,height=struct.unpack('>II',header[16:24])
+                for x,y in ([('from_x','from_y'),('to_x','to_y')] if args.get('action')=='drag' else [('x','y')]):
+                    if any(type(args.get(k)) not in {int,float} or not 0<=args[k]<=1000 for k in (x,y)):raise ValueError('Normalized point outside 0..1000')
+                    args[x]=args[x]*(width-1)/1000;args[y]=args[y]*(height-1)/1000
+            native=args
+        else:
+            allowed={'pid','window_id'}|({'keys'} if name=='hotkey' else {'key','modifiers'})
+            if set(args)-allowed:raise ValueError('Desktop keys accept key/modifiers only; use type_text for ordinary text')
+            source=None;native=key_arguments(name,args)
+        validate_native(native)
+        spec={'vm_id':self.config.vm_id,'kind':'desktop','tool':'desktop_input','arguments':native}
+        if source:spec['capture']=source
+        identifier=self.submit(spec);row=self.wait(identifier,seconds)
+        if row['state'] in {'succeeded','unverified'}:
+            read=self.call('get_desktop_state',{'include_screenshot':True},seconds=min(seconds,30))
+            row['post_readback']={'state':read['state'],'action_id':read['id'],'observation':read.get('result'),'verification':'observation_only_not_goal_completion'}
+        self.references.clear()
+        return row
 
 
 class ScrollSession:

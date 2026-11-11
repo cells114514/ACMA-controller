@@ -101,3 +101,21 @@ Earlier results use zero-based indices and JSON pointers. A missing/ambiguous re
 The crop above maps view origin to source pixel (100,200); when unscaled, view (50,20) maps to source (150,220). Tool guards still require the source capture to be fresh and belong to that PID/HWND. Views neither recapture the desktop nor renew freshness. Without a view, captured window coordinates are relative to the original window screenshot, and desktop coordinates to the original full-desktop screenshot; the native adapter verifies the mapping to physical pixels. Normalized 0–1000 coordinates are not accepted by this SDK.
 
 局部图本身不是新捕获，不延长源截图有效期；窗口坐标相对窗口原图、桌面坐标相对桌面原图，物理屏幕换算由已有适配器验证。归一化坐标不是本SDK接口。
+
+
+## v0.3 tool additions / 新增工具
+
+The HTTP API remains `/v1/call`; load exact parameter schemas with `/v1/tools`.
+
+| Tool | Required | Defaults / result |
+| --- | --- | --- |
+| run_command (v2) | command | cwd=configured workspace, env={}, timeout_seconds=30, wait_seconds=3, output_limit_bytes=32768 per stream; action_id/state/stdout/stderr/exit/result_json |
+| command_status / command_cancel | action_id | Original job observation or cancellation request; no replay |
+| shell_start | command | timeout_seconds=null, output_limit_bytes=65536; shell_id and startup acknowledgement |
+| shell_status | shell_id | stdout_offset=0, stderr_offset=0, max_bytes=65536 per stream; shell_state, next offsets, truncation, exit flags |
+| shell_stop | shell_id | Stop request, followed by shell_status to confirm actual exit |
+| desktop_mouse | action,capture,coordinate_space | x/y or drag endpoints; no PID/HWND, fresh registered desktop capture required |
+
+Ordinary runtime timeout is 0.1–120 seconds; optional persistent runtime cap is 0.1–2147483 seconds. Environment variables are process-only (64 names, 16000 total characters); cwd is an absolute guest drive path and must exist unless it is the configured task workspace. Output limits are 256–65536 bytes per stream, status max_bytes is 4–65536. Public HTTP request body bounds still apply to the combined UTF-8 JSON envelope.
+
+Global press_key/hotkey no longer require a window. Do not use key sequences as a substitute for unrestricted text insertion. All mutations still require resume; shell_status can observe while paused. Unknown-resource stop requires a preceding observation. The starting resource task identity is immutable; a query has its own action ID. `state=succeeded` for a query is not proof that the process exited; inspect shell_state/exit_confirmed/tree_terminated.

@@ -29,6 +29,14 @@ def definitions():
     from .vm_tools import definitions as vm_definitions
     for name in ('click','double_click','right_click','move_cursor','drag','scroll'):
         descriptions[name][1]['properties'].update(coordinate_space={'type':'string','enum':['screenshot_pixels','view_pixels']},view_id=text)
-    tools=[{'name':name,'description':d,'parameters':schema} for name,(d,schema) in descriptions.items()]+vm_definitions()
+    from .guest_commands import definitions as command_definitions
+    from .desktop_inputs import definitions as desktop_definition
+    legacy=descriptions.pop('run_command')[1]
+    for name in ('press_key','hotkey'):
+        descriptions[name][1]['required']=[k for k in descriptions[name][1]['required'] if k not in target]
+        descriptions[name]=(descriptions[name][0]+' Keys target the guest active desktop without window activation. Text insertion stays window-bound.',descriptions[name][1])
+    descriptions['press_key'][1]['properties']['modifiers']['items']['enum']=['ctrl','alt','shift','win']
+    tools=[{'name':name,'description':d,'parameters':schema} for name,(d,schema) in descriptions.items()]+vm_definitions()+command_definitions(legacy)+[desktop_definition()]
+    tools += [{'name':name,'description':'Query or cancel the original ordinary guest command; never replay it.','parameters':obj({'action_id':text},['action_id'])} for name in ('command_status','command_cancel')]
     from .batching import definitions as workflow_definitions
     return tools+workflow_definitions([t['name'] for t in tools]+['screenshot_view'])

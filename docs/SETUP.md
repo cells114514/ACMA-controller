@@ -54,3 +54,10 @@ Use a Windows host with Hyper-V management cmdlets, an existing VM, Python 3.11+
 7. Start with read-only calls, then dedicated test windows. No lock-screen bypass or authentication changes are provided.
 
 See [Microsoft's SSH configuration](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh-server-configuration) and [Cua documentation](https://cua.ai/docs/cua-driver). Reconnection first verifies the configured address; bounded automatic discovery supports Hyper-V Default Switch neighbors only and never replaces SSH/guest identity pins. Custom switches require explicit addresses.
+
+
+### 0.3 guest protocol upgrade / 客户机协议更新
+
+Upgrade the protected SSH entry, command-worker.ps1 and command-runner.cs as a matched set while no task or job is active. Preserve binding.json and SSH/Driver identities. The binding created by prepare_guest.ps1 must include guest_workspace. Do not rerun prepare_guest.ps1 over an existing protected registration blindly; it deliberately refuses to overwrite registrations. Verify hashes and restore any changed integration service state in your own deployment process. Package installation or passing CI does not deploy the guest components.
+
+For API v2 commands the controller checks command_capabilities first. Missing/old protocol fails before dispatch. To validate an independent deployment, run a harmless command with unique output, independently read it, start a short-lived background test, reopen the SDK with the same data directory, query the original ID, request stop and confirm process-tree exit. Do not count a startup or stop acknowledgement as terminal confirmation.

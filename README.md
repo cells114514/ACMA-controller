@@ -5,7 +5,7 @@
 
 [中文](#中文) · [English](#english) · [API](docs/API.md) · [Setup / 部署](docs/SETUP.md) · [Security / 边界](SECURITY.md)
 
-> **0.2.0 · Experimental / 实验版本** — Windows host + Windows guest, Hyper-V lifecycle management, Cua Driver desktop execution. Standard-library core, optional Pillow imaging extra; no model API key. / Windows 宿主与客户机，核心运行层仅用标准库，截图变换选装 Pillow，无需模型密钥。
+> **0.3.0 · Experimental / 实验版本** — Windows host + Windows guest, Hyper-V lifecycle management, Cua Driver desktop execution. Standard-library core, optional Pillow imaging extra; no model API key. / Windows 宿主与客户机，核心运行层仅用标准库，截图变换选装 Pillow，无需模型密钥。
 
 ## 中文
 
@@ -33,7 +33,7 @@ Windows 客户机 · 受保护桥接脚本 · 交互会话中的 Cua Driver
 | 桌面原子操作 | 应用/窗口枚举、UIA/截图、窗口激活、点击/双击/右键、文本、按键/快捷键、滚动、拖动、真实鼠标移动 |
 | 元素检索 | 本地确定性 `find_elements`，不调用模型，明确返回采集不完整状态 |
 | 滚入可视区 | `scroll_to_element`，最多六次滚轮手势并新读几何；不保证元素内部任意文字或遮挡情况 |
-| 客户机命令 | 专用起始目录中的 PowerShell；**目录不是安全沙箱**，命令拥有客户机账户权限 |
+| 客户机命令 | 完整PowerShell脚本、cwd/env/超时；普通命令异步查询/取消，长期Shell按ID增量查询/停止；**目录不是安全沙箱** |
 | Hyper-V | 状态/IP、开机、正常关机/重启、保存/恢复运行状态、检查点创建/列表/精确 ID 恢复 |
 | 执行管理 | 单 worker、持久回执、防止未知结果自动重发、暂停/恢复/停止、显式对账 |
 | 回读与证据 | 桌面动作后读取窗口状态；观察到变化不等于用户目标完成 |
@@ -111,7 +111,7 @@ It exposes a model-independent Python SDK and authenticated loopback HTTP interf
 | Desktop primitives | App/window enumeration, UIA/screenshots, activation, clicks, typing, keys, scrolling, dragging and real pointer movement |
 | Element search | Deterministic local `find_elements`; incomplete collection is explicit, not proof of absence |
 | Scroll into view | At most six wheel gestures using fresh UIA geometry; geometric visibility does not prove lack of occlusion |
-| Guest commands | PowerShell starting in the configured workspace; **the directory is not a security sandbox** |
+| Guest commands | Full PowerShell scripts, cwd/env/timeouts; ordinary command status/cancel and durable background Shell status/stop; **not a security sandbox** |
 | Hyper-V | Status/addresses, start, graceful shutdown/restart, save/resume state, checkpoint creation/listing/exact-ID restore |
 | Execution management | Single worker, persistent receipts, pause/resume/stop, reconciliation and no automatic replay of unknown actions |
 | Evidence | Post-action window observations, separately from semantic goal completion |
@@ -181,3 +181,18 @@ No personal configuration, credentials, screenshots, logs, databases or VM image
 `execute_batch` runs up to 16 actions sequentially, with a 30-second admission window. It stops on failure, unknown/mismatching results, pause or deadline and marks remaining actions `not_executed`; completed actions are not rolled back. Earlier-result references avoid guessing fresh tokens. Async commands, VM lifecycle actions, plans and nested batches are outside the batch interface.
 
 `screenshot_view` produces bounded full/cropped views with explicit reversible coordinates; use `view_pixels` + `view_id` for input mapping. Original capture freshness/target checks remain mandatory. Download view PNGs at `/v1/views/<view_id>`. Model screenshot retention/caching belongs in the agent layer, not this service. No Claude adapter or Anthropic SDK is added.
+
+
+## 0.3.0 — 命令资源与窗口无关输入 / Command resources and windowless input
+
+新增至39项工具，保留旧`run_command(script, timeout_ms, output_limit)`兼容。新版`run_command(command, cwd?, env?, timeout_seconds?, wait_seconds?, output_limit_bytes?)`、`command_status(action_id)`、`command_cancel(action_id)`，以及`shell_start`、`shell_status`、`shell_stop`均经同一控制队列与固定SSH桥接执行。首次v2命令派发前只读检查客户机协议；旧桥接拒绝，不发送任务脚本。需要部署本版本的entry/worker/runner三份文件，不要只升级宿主Python包。
+
+`run_command`默认30秒运行时限、3秒短等待及每流32768字节；长期Shell默认无运行时限、每流65536字节保留上限，接受完整脚本而非交互终端，无stdin/TTY或追加第二条命令。关闭SDK不终止已启动Shell；重新用同一VM和执行目录打开后可查询原ID。`status()`中的background_shells只是登记/最近观察，实时状态须shell_status。客户机重启不会自动重启脚本。输出游标为UTF-8字节偏移，只遍历有界保留前缀；完整长期日志应由脚本写客户机文件。
+
+`shell_start`登记成功不等于进程就绪；`shell_status`的state表示查询动作，shell_state表示进程。`shell_stop`返回请求ACK后仍需查询退出，核对exit_confirmed及tree_terminated。未知普通命令通过原job核对，不重发。跨查询和SDK重开，原origin_task_id不变。HTTP请求防重仍使用原request_id；不要因超时换ID重发启动或停止。
+
+`desktop_mouse(action, capture, coordinate_space, ...)`支持click/double_click/right_click/move/scroll/drag，无需PID/HWND、不激活窗口；需要30秒内的注册桌面截图及范围内坐标，支持screenshot_pixels、normalized_1000和注册view_pixels。原有绑定窗口的click等保留。press_key/hotkey改为作用于客户机活动桌面，可使用win修饰键；不需要窗口参数，旧参数仅兼容忽略。普通type_text保持精确窗口绑定，未开放set_value。发送后默认回读桌面，投递与观察均不替代上层目标判断。
+
+English: v0.3 adds generic guest PowerShell and durable background jobs while keeping the legacy script interface. A read-only v2 capability check precedes dispatch. Persistent jobs survive SDK closure but do not auto-restart after guest reboot; bounded UTF-8 output cursors and explicit stop/exit confirmation are provided. `desktop_mouse` uses a fresh registered desktop capture without window activation; keys/hotkeys address the active guest desktop, while text insertion remains window-bound. The transport, configurable binding, single-VM lock, batches, optional imaging and request deduplication remain intact.
+
+These additions are covered by protocol/fake-backend tests, including SDK reopen with the same original resource ID. They are not new live acceptance of this independent package on a VM. The original agent's scoped command/Shell evidence cannot replace independent SDK deployment validation.

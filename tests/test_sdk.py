@@ -89,7 +89,7 @@ class SDKTests(unittest.TestCase):
                               capture_output=True,encoding='utf-8',env=env,timeout=10)
         self.assertEqual(result.returncode,0,result.stderr)
         catalog=json.loads(result.stdout)
-        self.assertEqual(len(catalog),33)
+        self.assertEqual(len(catalog),39)
         self.assertTrue(all('parameters' in t for t in catalog))
 
     def test_runtime_is_pinned_to_a_single_vm(self):

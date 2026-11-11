@@ -5,6 +5,7 @@ KEYBOARD={'type_text','set_value','press_key','hotkey'}
 
 def infer(spec):
     tool=spec.get('tool');args=spec.get('arguments',{})
+    if tool=='desktop_input':return {'mouse':args.get('action')!='key','keyboard':args.get('action')=='key'}
     mouse=spec.get('kind')=='desktop' and tool in MOUSE
     keyboard=spec.get('kind')=='desktop' and tool in KEYBOARD
     if mouse and any(args.get(k) for k in ('modifier','modifiers')):keyboard=True

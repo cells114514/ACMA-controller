@@ -17,7 +17,7 @@ from .config import current, runtime_root
 ROOT = Path(__file__).resolve().parent
 VM_ID = current().vm_id
 WORKSPACE = current().guest_workspace
-READ = {"list_apps", "list_windows", "get_window_state", "get_desktop_state", "get_screen_size", "get_cursor_position", "health_report"}
+READ = {"list_apps", "list_windows", "get_window_state", "get_desktop_state", "get_screen_size", "get_cursor_position", "health_report", "shell_status"}
 WRITE = {"bring_to_front", "click", "double_click", "right_click", "type_text", "press_key", "hotkey", "drag", "scroll", "move_cursor", "launch_app"}
 TERMINAL = {"succeeded", "failed", "unknown", "cancelled", "unverified", "refused", "timed_out", "stopped"}
 
@@ -30,14 +30,42 @@ def validate(spec):
     if spec.get("vm_id") != VM_ID:
         raise ValueError("Only the registered guest VM is allowed")
     kind = spec.get("kind")
+    if kind=='shell_control' or kind=='observe' and spec.get('tool')=='shell_status':
+        if spec.get('tool')!=('shell_stop' if kind=='shell_control' else 'shell_status'):raise ValueError('Unknown shell control')
+        args=spec.get('arguments',{})
+        import re
+        if not isinstance(args,dict) or not re.fullmatch('[0-9a-f]{32}',str(args.get('shell_id',''))):raise ValueError('Registered shell_id required')
+        allowed={'shell_id','resource_kind'}|({'stdout_offset','stderr_offset','max_bytes'} if kind=='observe' else set())
+        if set(args)-allowed:raise ValueError('Unexpected Shell arguments')
+        if args.get('resource_kind','shell') not in {'shell','command'}:raise ValueError('Unknown command resource kind')
+        for key in ('stdout_offset','stderr_offset'):
+            if key in args and (type(args[key]) is not int or args[key]<0):raise ValueError('Invalid output cursor')
+        if 'max_bytes' in args and (type(args['max_bytes']) is not int or not 4<=args['max_bytes']<=65536):raise ValueError('Invalid output budget')
+        return spec
+    if kind=='desktop' and spec.get('tool')=='desktop_input':
+        from .desktop_inputs import validate_native
+        validate_native(spec.get('arguments'))
+        if spec.get('delivery') or 'surface' in spec:raise ValueError('Desktop input has no window delivery mode')
+        if spec['arguments']['action']!='key' and not isinstance(spec.get('capture'),str):raise ValueError('Desktop mouse requires a desktop capture')
+        bind_input(spec)
+        return spec
     if kind == "command":
         if not isinstance(spec.get("script"), str) or not 1 <= len(spec["script"]) <= 16000:
             raise ValueError("Guest PowerShell script required, at most 16000 characters")
+        if not isinstance(spec.get('cwd',WORKSPACE),str):raise ValueError('Guest cwd must be a string')
+        timeout, limit = spec.get('timeout_ms',10000),spec.get('output_limit',8192)
+        if type(timeout) is not int or type(limit) is not int:raise ValueError('Invalid command budgets')
+        if 'command_v2' in spec and type(spec['command_v2']) is not bool or 'background' in spec and type(spec['background']) is not bool:raise ValueError('Command mode flags must be boolean')
         cwd = spec.get("cwd", WORKSPACE).replace("/", "\\").rstrip("\\")
-        if cwd.casefold() != WORKSPACE.casefold() or ".." in cwd:
+        if spec.get('command_v2'):
+            from .guest_commands import validate_parameters
+            validate_parameters({'command':spec['script'],'cwd':spec.get('cwd',WORKSPACE),'env':spec.get('env',{}),'output_limit_bytes':spec.get('output_limit',32768),
+                'timeout_seconds':None if spec.get('background') and spec.get('timeout_ms')==0 else spec.get('timeout_ms',30000)/1000},bool(spec.get('background')))
+        elif cwd.casefold() != WORKSPACE.casefold() or ".." in cwd:
             raise ValueError("P1 commands start only in the dedicated guest workspace")
         timeout, limit = spec.get("timeout_ms", 10000), spec.get("output_limit", 8192)
-        if type(timeout) is not int or type(limit) is not int or not 100 <= timeout <= 120000 or not 256 <= limit <= 65536:
+        valid_timeout=timeout==0 or 100<=timeout<=2147483000 if spec.get('command_v2') and spec.get('background') else 100<=timeout<=120000
+        if type(timeout) is not int or type(limit) is not int or not valid_timeout or not 256 <= limit <= 65536:
             raise ValueError("Invalid command budgets")
     elif kind in {"observe", "desktop"}:
         tool = spec.get("tool")
@@ -103,7 +131,7 @@ def validate(spec):
                 raise ValueError('Keyboard input requires foreground; mouse delivery is selected by validated input profile')
         if tool == "drag" and not 1 <= args.get("duration_ms", 500) <= 2000:
             raise ValueError("P1 drag limit is 2 seconds")
-        if tool in {"type_text"} and len(args.get("text", args.get("value", ""))) > 4096:
+        if tool in {"type_text", "set_value"} and len(args.get("text", args.get("value", ""))) > 4096:
             raise ValueError("Text exceeds P1 action budget")
         coords = {k: args[k] for k in ("x", "y", "from_x", "from_y", "to_x", "to_y") if k in args}
         if coords:
@@ -217,7 +245,7 @@ class Store:
             mode = db.execute("SELECT value FROM settings WHERE key='mode'").fetchone()[0]
             deadline=db.execute('SELECT expires FROM task_deadlines WHERE task_id=?',(task_id,)).fetchone()
             if deadline and time.time()>=deadline[0]:raise ValueError('Task countdown ended; no new action admitted')
-            if mode != "running" and spec["kind"] != "observe":
+            if mode != "running" and spec["kind"] != "observe" and not (mode=="unknown" and spec["kind"]=="shell_control"):
                 raise ValueError("Input/command admission closed: " + mode)
             db.execute("INSERT INTO actions(id,task_id,submitted,state,spec) VALUES(?,?,?,?,?)",
                        (action_id, task_id or uuid.uuid4().hex, now(), "queued", json.dumps(spec, ensure_ascii=False)))
@@ -251,7 +279,7 @@ class Store:
                        (now(),json.dumps({'dispatched':False,'reason':'Task countdown ended before dispatch'}),time.time()))
             mode = db.execute("SELECT value FROM settings WHERE key='mode'").fetchone()[0]
             rows = db.execute("SELECT id,spec FROM actions WHERE state='queued' ORDER BY submitted").fetchall()
-            row = next((r for r in rows if mode == "running" or json.loads(r["spec"])["kind"] == "observe"), None)
+            row = next((r for r in rows if mode == "running" or json.loads(r["spec"])["kind"] == "observe" or mode=="unknown" and json.loads(r["spec"])["kind"]=="shell_control"), None)
             if row:
                 db.execute("UPDATE actions SET state='running',started=? WHERE id=?", (now(), row["id"]))
                 return row["id"], json.loads(row["spec"])
@@ -272,13 +300,14 @@ class Store:
     def resolve(self, action_id, outcome, evidence):
         if outcome not in {'failed', 'succeeded', 'cancelled'} or not isinstance(evidence, str) or len(evidence.strip()) < 10:
             raise ValueError('Explicit outcome and reconciliation evidence required')
-        row = self.get(action_id)
-        if row['state'] != 'unknown':
-            raise ValueError('Only unknown actions require reconciliation')
-        result = row['result'] or {}
-        result['resolution'] = {'previous_state': 'unknown', 'outcome': outcome, 'evidence': evidence, 'time': now()}
-        self.finish(action_id, outcome, result)
         with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row=db.execute('SELECT state,result FROM actions WHERE id=?',(action_id,)).fetchone()
+            if not row or row['state']!='unknown':raise ValueError('Only unknown actions require reconciliation')
+            result=json.loads(row['result'] or '{}')
+            result['resolution'] = {'previous_state': 'unknown', 'outcome': outcome, 'evidence': evidence, 'time': now()}
+            db.execute('UPDATE actions SET state=?,finished=?,result=? WHERE id=?',
+                       (outcome,now(),json.dumps(result,ensure_ascii=False),action_id))
             db.execute('INSERT INTO events(time,kind,detail) VALUES(?,?,?)', (now(), 'resolution', json.dumps(result['resolution'])))
             if not db.execute("SELECT 1 FROM actions WHERE state='unknown' LIMIT 1").fetchone():
                 db.execute("UPDATE settings SET value='paused' WHERE key='mode' AND value='unknown'")
@@ -344,6 +373,21 @@ class Store:
         if previous["state"] != "succeeded" or not result.get("capture_id"):
             raise ValueError("Capture is not a successful observed image")
         args = spec["arguments"]
+        if spec.get('tool')=='desktop_input':
+            if previous['spec'].get('tool')!='get_desktop_state':raise ValueError('Windowless mouse requires a desktop screenshot')
+            observed=result.get('observed_at')
+            if not observed or not -1<=(datetime.now(timezone.utc)-datetime.fromisoformat(observed)).total_seconds()<=30:raise ValueError('Desktop screenshot expired')
+            width=result.get('image_width') or result.get('width');height=result.get('image_height') or result.get('height')
+            if not width or not height:
+                import struct
+                path=Path(result.get('image_path',''))
+                if not path.is_file():raise ValueError('Desktop screenshot dimensions unavailable')
+                with path.open('rb') as stream:header=stream.read(24)
+                if header[:8]!=b'\x89PNG\r\n\x1a\n':raise ValueError('Expected desktop PNG')
+                width,height=struct.unpack('>II',header[16:24])
+            pairs=[('from_x','from_y'),('to_x','to_y')] if args['action']=='drag' else [('x','y')]
+            if any(not (0<=args[x]<width and 0<=args[y]<height) for x,y in pairs):raise ValueError('Desktop mouse outside screenshot')
+            return result
         if spec["tool"] == "move_cursor" or args.get('scope')=='desktop':
             if previous['spec'].get('tool')!='get_desktop_state' or result.get('pid') or result.get('window_id'):raise ValueError('Desktop input requires a desktop capture')
             width, height = result.get("screen_width"), result.get("screen_height")
@@ -367,11 +411,15 @@ class Store:
 
 
 class GuestBackend:
+    def desktop_input(self,args):
+        from .desktop_inputs import driver_call
+        tool,arguments=driver_call(args)
+        return self.cua(tool,arguments)
     diagnostic_screenshots=True
     def __init__(self):
         from . import transport
         self.remote = transport
-        self.config = self.remote.load_connection()
+        self.config = None
 
     def prepare_transport(self):
         from .network import refresh
@@ -380,6 +428,7 @@ class GuestBackend:
         return evidence
 
     def request(self, op, tool=None, arguments=None):
+        if self.config is None:self.prepare_transport()
         reply = self.remote.request(self.config, op, tool, arguments)
         if op == 'command_status' and reply.get('command', {}).get('state') in {'succeeded', 'failed', 'stopped', 'timed_out'}:
             result = reply['command']
@@ -595,115 +644,177 @@ class Worker:
         return result
 
     def execute(self, action_id, spec):
-        if spec["kind"] == "command":
+        try:
+            record = self.store.get(action_id)
+        except KeyError:
+            record = None
+        identity = None
+        if spec.get('tool') in {'shell_status', 'shell_stop'}:
+            if spec['tool'] == 'shell_stop' and self.store.mode() != 'unknown':
+                self.gate()
+            original = self.store.get(spec['arguments']['shell_id'])
+            background = spec['arguments'].get('resource_kind', 'shell') == 'shell'
+            if not original['spec'].get('command_v2') or bool(original['spec'].get('background')) != background or original['state'] not in {'succeeded', 'unknown'}:
+                return ('refused', {'error': 'Command resource startup not confirmed', 'dispatched': False})
+            if spec['tool'] == 'shell_stop' and original['state'] == 'unknown' and ((original.get('result') or {}).get('last_shell_state') not in {'running', 'starting', 'stop_requested'}):
+                return ('refused', {'error': 'Read shell_status before stopping an uncertain startup', 'dispatched': False})
+            args = spec['arguments']
+            reply = self.backend.request('command_status' if spec['tool'] == 'shell_status' else 'command_cancel', arguments={'job_id': args['shell_id'], **{k: args[k] for k in ('stdout_offset', 'stderr_offset', 'max_bytes') if k in args}})
+            job = reply['command']
+            with self.store.db() as db:
+                prior = original.get('result') or {}
+                prior.update(last_shell_state=job.get('state', 'unknown'), last_observed_at=now())
+                db.execute('UPDATE actions SET result=? WHERE id=?', (json.dumps(prior, ensure_ascii=False), original['id']))
+            return ('succeeded', {'shell_state': job.get('state', 'unknown'), **{k: v for k, v in job.items() if k != 'state'}})
+        if spec.get('tool') == 'desktop_input':
             self.gate()
+            if spec.get('capture'):
+                self.store.check_capture(spec)
+            result = self.backend.desktop_input(spec['arguments'])
+            result['input'] = bind_input(spec)
+            result['dispatch'] = {'scope': 'desktop', 'guard': 'guest_session_and_screen_bounds', 'window_activation': False, 'operation': spec['arguments']['action']}
+            if result.get('refusal') or result.get('effect') == 'refused':
+                return ('refused', result)
+            if result.get('error') or result.get('effect') == 'unknown':
+                return ('unknown', result)
+            return ('unverified', result)
+        if spec['kind'] == 'command':
+            self.gate()
+            if spec.get('command_v2'):
+                try:
+                    health = self.backend.request('command_capabilities')
+                except Exception:
+                    return ('refused', {'error': 'Guest command API v2 preflight unavailable; no command sent', 'dispatched': False})
+                if health.get('command_api_version') != 2:
+                    return ('refused', {'error': 'Guest command API v2 is not deployed; no command sent', 'dispatched': False})
+                self.gate()
             job_id = action_id
-            args = {"job_id": job_id, "script": spec["script"], "cwd": spec.get("cwd", WORKSPACE),
-                    "timeout_ms": spec.get("timeout_ms", 10000), "output_limit": spec.get("output_limit", 8192)}
-            started = self.backend.request("command_start", arguments=args)
+            args = {'job_id': job_id, 'script': spec['script'], 'cwd': spec.get('cwd', WORKSPACE), 'timeout_ms': spec.get('timeout_ms', 10000), 'output_limit': spec.get('output_limit', 8192)}
+            if spec.get('command_v2'):
+                args.update(command_api_version=2, env=spec.get('env', {}), persistent=bool(spec.get('background')))
+            if spec.get('command_v2'):
+                with self.store.db() as db:
+                    deadline_row = db.execute('SELECT expires FROM task_deadlines WHERE task_id=?', (record['task_id'],)).fetchone() if record else None
+                if deadline_row:
+                    remaining_ms = int((deadline_row[0] - time.time()) * 1000)
+                    if remaining_ms < 100:
+                        return ('refused', {'error': 'Task countdown ended before command start', 'dispatched': False})
+                    if not spec.get('background'):
+                        args['timeout_ms'] = min(args['timeout_ms'], remaining_ms)
+            started = self.backend.request('command_start', arguments=args)
+            if started.get('outcome') == 'rejected_before_dispatch' and started.get('dispatched') is False:
+                return ('refused', started)
+            if spec.get('command_v2') and spec.get('background'):
+                return ('succeeded', {'state': started['command'].get('state', 'starting'), 'persistent': True, 'computer': started.get('computer'), 'user_sid': started.get('user_sid'), 'exit_confirmed': False, 'dispatched': True})
             cancelled = False
             cancel_reply = None
-            deadline = time.monotonic() + args["timeout_ms"] / 1000 + 30
+            deadline = time.monotonic() + args['timeout_ms'] / 1000 + 30
             while time.monotonic() < deadline:
                 mode = self.store.mode()
-                if (mode == "stop_requested" or self.store.command_cancel_requested(action_id)) and not cancelled:
-                    cancel_reply = self.backend.request("command_cancel", arguments={"job_id": job_id})
+                if (mode == 'stop_requested' or self.store.command_cancel_requested(action_id)) and (not cancelled):
+                    cancel_reply = self.backend.request('command_cancel', arguments={'job_id': job_id})
                     cancelled = True
-                reply = self.backend.request("command_status", arguments={"job_id": job_id})
-                result = reply["command"]
-                result["response_file"] = reply["response_file"]
+                reply = self.backend.request('command_status', arguments={'job_id': job_id})
+                result = reply['command']
+                result['response_file'] = reply['response_file']
                 result['start_response_file'] = started['response_file']
                 if cancel_reply:
                     result['stop_request'] = cancel_reply['command']
                     result['stop_response_file'] = cancel_reply['response_file']
-                if result["state"] not in {"starting", "running"}:
-                    return result["state"], result
+                if result['state'] not in {'starting', 'running'}:
+                    return (result['state'], result)
+                if spec.get('command_v2'):
+                    with self.store.db() as db:
+                        db.execute("UPDATE actions SET result=? WHERE id=? AND state='running'", (json.dumps(result, ensure_ascii=False), action_id))
                 time.sleep(0.25)
-            return "unknown", {"job_id": job_id, "error": "Command result deadline elapsed; no repeat execution"}
-        args = dict(spec.get("arguments", {}))
-        tool = spec["tool"]
+            return ('unknown', {'job_id': job_id, 'error': 'Command result deadline elapsed; no repeat execution'})
+        args = dict(spec.get('arguments', {}))
+        tool = spec['tool']
         focus = None
-        inputs=bind_input(spec)
-        pointer=None;windows_before=None
-        if spec["kind"] == "desktop":
+        inputs = bind_input(spec)
+        pointer = None
+        windows_before = None
+        if spec['kind'] == 'desktop':
             self.gate()
-            if spec.get("capture"):
+            if spec.get('capture'):
                 capture = self.store.check_capture(spec)
-                if tool != "move_cursor":
-                    if args.get('scope')=='desktop':capture=self.store.desktop_drag_target(spec)
-                    current = self.backend.cua("list_windows", {})
-                    windows = [w for w in current.get("windows", []) if w.get("pid") == args["pid"] and w.get("window_id") == args["window_id"]]
-                    if len(windows) != 1 or windows[0].get("bounds") != capture.get("window_bounds"):
-                        return "refused", {"error": "Window geometry changed; obtain a fresh capture"}
+                if tool != 'move_cursor':
+                    if args.get('scope') == 'desktop':
+                        capture = self.store.desktop_drag_target(spec)
+                    current = self.backend.cua('list_windows', {})
+                    windows = [w for w in current.get('windows', []) if w.get('pid') == args['pid'] and w.get('window_id') == args['window_id']]
+                    if len(windows) != 1 or windows[0].get('bounds') != capture.get('window_bounds'):
+                        return ('refused', {'error': 'Window geometry changed; obtain a fresh capture'})
             if inputs['keyboard']:
-                focus = self.backend.cua("bring_to_front", {"pid": args["pid"], "window_id": args["window_id"]})
-                if not focus.get("landed_on_target") or int(focus.get("now_fg_hwnd", "0"), 0) != args["window_id"]:
-                    return "refused", {"error": "Exact foreground not verified", "focus": focus}
-                args["delivery_mode"] = "foreground"
+                focus = self.backend.cua('bring_to_front', {'pid': args['pid'], 'window_id': args['window_id']})
+                if not focus.get('landed_on_target') or int(focus.get('now_fg_hwnd', '0'), 0) != args['window_id']:
+                    return ('refused', {'error': 'Exact foreground not verified', 'focus': focus})
+                args['delivery_mode'] = 'foreground'
             if inputs['mouse']:
-                try:source=self.store.pointer_source(spec)
-                except ValueError as error:return 'refused',{'effect':'refused','error':str(error),'input':inputs}
-                if not hasattr(self.backend,'pointer_probe'):return 'refused',{'effect':'refused','error':'Pointer validation backend unavailable','input':inputs}
-                pointer=self.backend.pointer_probe(args,source)
-                pointer['expected_label']=source.get('expected_label')
-                if not pointer.get('confirmed'):return 'refused',{'effect':'refused','error':'Pointer hit/occlusion validation failed','input':inputs,'pointer_verification':pointer}
-                if args.get('scope')=='desktop' and tool in {'drag','click'}:args.pop('delivery_mode',None)
-                elif not inputs['keyboard'] and tool!='move_cursor':args['delivery_mode']=spec.get('delivery',{}).get('mode',args.get('delivery_mode','background'))
+                try:
+                    source = self.store.pointer_source(spec) if identity else self.store.pointer_source(spec)
+                except ValueError as error:
+                    return ('refused', {'effect': 'refused', 'error': str(error), 'input': inputs})
+                if not hasattr(self.backend, 'pointer_probe'):
+                    return ('refused', {'effect': 'refused', 'error': 'Pointer validation backend unavailable', 'input': inputs})
+                pointer = self.backend.pointer_probe(args, source)
+                pointer['expected_label'] = source.get('expected_label')
+                if not pointer.get('confirmed'):
+                    return ('refused', {'effect': 'refused', 'error': 'Pointer hit/occlusion validation failed', 'input': inputs, 'pointer_verification': pointer})
+                if args.get('scope') == 'desktop' and tool in {'drag', 'click'}:
+                    args.pop('delivery_mode', None)
+                elif not inputs['keyboard'] and tool != 'move_cursor':
+                    args['delivery_mode'] = spec.get('delivery', {}).get('mode', args.get('delivery_mode', 'background'))
             self.gate()
-        # 0.38.0 hotkey's XAML branch precedes foreground routing and misclassifies
-        # classic Notepad. press_key+modifiers is the supported explicit SendInput route.
         requested_tool = tool
         if spec['kind'] == 'desktop' and tool == 'hotkey':
             keys = args.pop('keys')
-            args['key'], args['modifiers'] = keys[-1], keys[:-1]
+            args['key'], args['modifiers'] = (keys[-1], keys[:-1])
             tool = 'press_key'
-        if spec['kind']=='desktop' and tool in {'click','double_click','right_click'} and hasattr(self.backend,'window_transition_probe'):
-            windows_before=self.backend.cua('list_windows',{}).get('windows',[])
+        if spec['kind'] == 'desktop' and tool in {'click', 'double_click', 'right_click'} and hasattr(self.backend, 'window_transition_probe'):
+            windows_before = self.backend.cua('list_windows', {}).get('windows', [])
         result = self.backend.cua(tool, args)
-        if result.get('effect')=='unknown' and windows_before is not None:
-            from .window_transition import post_click_window,verify_transition
-            candidate=post_click_window(result.get('error'))
+        if result.get('effect') == 'unknown' and windows_before is not None:
+            from .window_transition import post_click_window, verify_transition
+            candidate = post_click_window(result.get('error'))
             if candidate:
                 try:
-                    after=self.backend.cua('list_windows',{}).get('windows',[])
-                    probe=self.backend.window_transition_probe({'pid':args['pid'],'window_id':args['window_id']},candidate)
-                    prior=(pointer or {}).get('target_identity')
-                    source_gone=not any((w.get('pid'),w.get('window_id'))==(args['pid'],args['window_id']) for w in after)
-                    candidate_state=None
-                    if prior and source_gone and probe.get('foreground_hwnd')!=candidate and probe.get('candidate',{}).get('pid'):
-                        candidate_state=self.backend.cua('get_window_state',{'pid':probe['candidate']['pid'],
-                            'window_id':candidate,'include_screenshot':False,'tree_format':'elements'})
-                    transition=verify_transition({'pid':args['pid'],'window_id':args['window_id']},windows_before,after,probe,candidate,
-                                                 source_identity=prior,candidate_state=candidate_state)
-                    if transition['status']=='verified':
-                        from .application_policy import check_app,launch_name
+                    after = self.backend.cua('list_windows', {}).get('windows', [])
+                    probe = self.backend.window_transition_probe({'pid': args['pid'], 'window_id': args['window_id']}, candidate)
+                    prior = (pointer or {}).get('target_identity')
+                    source_gone = not any(((w.get('pid'), w.get('window_id')) == (args['pid'], args['window_id']) for w in after))
+                    candidate_state = None
+                    if prior and source_gone and (probe.get('foreground_hwnd') != candidate) and probe.get('candidate', {}).get('pid'):
+                        candidate_state = self.backend.cua('get_window_state', {'pid': probe['candidate']['pid'], 'window_id': candidate, 'include_screenshot': False, 'tree_format': 'elements'})
+                    transition = verify_transition({'pid': args['pid'], 'window_id': args['window_id']}, windows_before, after, probe, candidate, source_identity=prior, candidate_state=candidate_state)
+                    if transition['status'] == 'verified':
+                        from .application_policy import check_app, launch_name
                         check_app(transition['next_target'].get('app_name'))
                         check_app(launch_name(probe['candidate']['exe_path']))
-                        result['original_error']=result.pop('error');result['original_effect']=result['effect'];result['effect']='confirmed'
-                    result['window_transition']=transition
-                except Exception as error:result['window_transition']={'status':'unverified','reason':str(error),'input_replayed':False}
-
-        result['input']=inputs
-        result['dispatch']={'tool':tool,'delivery_mode':args.get('delivery_mode'),
-                            'scope':args.get('scope','window'),
-                            'selection':'explicit' if spec.get('delivery') or 'delivery_mode' in spec.get('arguments',{}) else 'controller_default',
-                            'guard':'mouse_hit_and_keyboard_focus' if inputs['mouse'] and inputs['keyboard'] else 'mouse_hit' if inputs['mouse'] else 'keyboard_focus' if inputs['keyboard'] else 'no_hid_input'}
-        if pointer:result['pointer_verification']=pointer
+                        result['original_error'] = result.pop('error')
+                        result['original_effect'] = result['effect']
+                        result['effect'] = 'confirmed'
+                    result['window_transition'] = transition
+                except Exception as error:
+                    result['window_transition'] = {'status': 'unverified', 'reason': str(error), 'input_replayed': False}
+        result['input'] = inputs
+        result['dispatch'] = {'tool': tool, 'delivery_mode': args.get('delivery_mode'), 'scope': args.get('scope', 'window'), 'selection': 'explicit' if spec.get('delivery') or 'delivery_mode' in spec.get('arguments', {}) else 'controller_default', 'guard': 'mouse_hit_and_keyboard_focus' if inputs['mouse'] and inputs['keyboard'] else 'mouse_hit' if inputs['mouse'] else 'keyboard_focus' if inputs['keyboard'] else 'no_hid_input'}
+        if pointer:
+            result['pointer_verification'] = pointer
         if focus:
-            result['focus_verification'] = {'landed_on_target': focus.get('landed_on_target'),
-                                             'now_fg_hwnd': focus.get('now_fg_hwnd'), 'response_file': focus.get('response_file')}
+            result['focus_verification'] = {'landed_on_target': focus.get('landed_on_target'), 'now_fg_hwnd': focus.get('now_fg_hwnd'), 'response_file': focus.get('response_file')}
         if requested_tool != tool:
-            result['requested_tool'], result['executed_tool'] = requested_tool, tool
-        if spec["kind"] == "observe":
-            return ("failed" if result.get("error") else "succeeded"), result
-        effect = result.get("effect")
-        if result.get("refusal") or effect == "refused" or result.get("status") == "refused":
-            return "refused", result
-        if result.get("error") or effect == "unknown":
-            return "unknown", result
-        if effect == "confirmed" or (tool == "bring_to_front" and result.get("landed_on_target")):
-            return "succeeded", result
-        return "unverified", result
+            result['requested_tool'], result['executed_tool'] = (requested_tool, tool)
+        if spec['kind'] == 'observe':
+            return ('failed' if result.get('error') else 'succeeded', result)
+        effect = result.get('effect')
+        if result.get('refusal') or effect == 'refused' or result.get('status') == 'refused':
+            return ('refused', result)
+        if result.get('error') or effect == 'unknown':
+            return ('unknown', result)
+        if effect == 'confirmed' or (tool == 'bring_to_front' and result.get('landed_on_target')):
+            return ('succeeded', result)
+        return ('unverified', result)
 
     def tick(self):
         mode = self.store.mode()
@@ -739,15 +850,20 @@ class Worker:
                     with self.store.db() as db:
                         row=db.execute("SELECT value FROM settings WHERE key='guest_transport_generation'").fetchone()
                     generation=row[0] if row else 'initial'
+                    command_path=spec['kind'] in {'command','shell_control'} or spec.get('tool')=='shell_status'
+                    generation=(generation,'command' if command_path else 'desktop')
                     if self.guest_generation!=generation:
-                        try:self.prepare_guest()
+                        try:
+                            if command_path:
+                                if hasattr(self.backend,'prepare_transport'):self.backend.prepare_transport()
+                            else:self.prepare_guest()
                         except Exception as error:
                             self.store.finish(action_id,'refused',{'effect':'refused','dispatched':False,
                                 'error':'客户机连接尚未就绪；宿主VM工具仍可使用：'+str(error),
                                 'retry_action':False,'refusal':{'code':'guest_unavailable_before_dispatch'}})
                             return True
                         self.guest_generation=generation
-                    if self.store.mode()!='running' and spec['kind']!='observe':
+                    if self.store.mode()!='running' and spec['kind']!='observe' and not (self.store.mode()=='unknown' and spec['kind']=='shell_control'):
                         self.store.finish(action_id,'cancelled',{'dispatched':False,'reason':'Control changed during guest handshake'})
                         return True
                 state, result = self.execute(action_id, spec)
